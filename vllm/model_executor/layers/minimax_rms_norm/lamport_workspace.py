@@ -4,6 +4,7 @@
 
 import array
 import contextlib
+import ctypes
 import struct
 import sys
 import threading
@@ -59,6 +60,22 @@ def _cuda_memcpy_d2d(dst: int, src: int, size: int):
 # ---------------------------------------------------------------------------
 
 
+# sizeof(cudaIpcMemHandle_t): CUDA_IPC_HANDLE_SIZE
+_IPC_HANDLE_SIZE = 64
+
+
+def _ipc_handle_to_bytes(handle) -> bytes:
+    # cuda-bindings 12.x exposes the raw struct as ``reserved``; 13.x only
+    # exposes the pointer, so read the bytes through it on both.
+    return ctypes.string_at(handle.getPtr(), _IPC_HANDLE_SIZE)
+
+
+def _ipc_handle_from_bytes(data: bytes):
+    handle = cudart.cudaIpcMemHandle_t()
+    ctypes.memmove(handle.getPtr(), data, _IPC_HANDLE_SIZE)
+    return handle
+
+
 class IpcBuffer:
     """Allocates CUDA device memory and exchanges IPC handles with all ranks
     so that every rank holds a valid device pointer to every other rank's buffer.
@@ -84,15 +101,16 @@ class IpcBuffer:
 
         all_handles: list[bytes | None] = [None] * world_size
         torch.distributed.all_gather_object(
-            all_handles, bytes(local_handle.reserved), group=process_group
+            all_handles, _ipc_handle_to_bytes(local_handle), group=process_group
         )
 
         for r in range(world_size):
             if r == rank:
                 self.peer_ptrs[r] = self.local_ptr
             else:
-                handle = cudart.cudaIpcMemHandle_t()
-                handle.reserved = all_handles[r]
+                peer_handle = all_handles[r]
+                assert peer_handle is not None
+                handle = _ipc_handle_from_bytes(peer_handle)
                 err, ptr = cudart.cudaIpcOpenMemHandle(
                     handle, cudart.cudaIpcMemLazyEnablePeerAccess
                 )
